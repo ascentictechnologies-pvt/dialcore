@@ -360,6 +360,15 @@ ok "User '${INSTALL_USER}' and directories ready"
 # ── Phase 10: Configure PostgreSQL ──────────────────────────────────────────
 header "Phase 10 — PostgreSQL Database Setup"
 
+# Ensure postgres superuser can connect via Unix socket without a password prompt.
+# Default Ubuntu pg_hba.conf has peer auth, but some deployments remove it.
+PG_HBA="/etc/postgresql/16/main/pg_hba.conf"
+if ! grep -qE "^local[[:space:]]+all[[:space:]]+postgres[[:space:]]+peer" "${PG_HBA}"; then
+  sed -i "1s/^/local   all             postgres                                peer\n/" "${PG_HBA}"
+  systemctl reload postgresql
+  sleep 2
+fi
+
 # Create user and database if not exists
 sudo -u postgres psql -tc "SELECT 1 FROM pg_user WHERE usename='dialcore'" \
   | grep -q 1 || sudo -u postgres psql \
@@ -376,7 +385,6 @@ sudo -u postgres psql -d dialcore -c \
 sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE dialcore TO dialcore;"
 
 # pg_hba: allow dialcore user via scram-sha-256 on localhost
-PG_HBA="/etc/postgresql/16/main/pg_hba.conf"
 if ! grep -q "dialcore.*scram-sha-256" "${PG_HBA}"; then
   sed -i "/^host.*all.*all.*127\.0\.0\.1.*ident/i host    dialcore        dialcore        127.0.0.1/32            scram-sha-256\nhost    dialcore        dialcore        ::1/128                 scram-sha-256" "${PG_HBA}"
   systemctl reload postgresql
@@ -509,7 +517,9 @@ if ! $NO_SSL; then
     ssl_session_tickets off;"
 fi
 
-LISTEN_HTTPS="443 ssl"
+# http2 on the listen line works for all Nginx versions (>= 1.9.5).
+# The standalone "http2 on;" directive requires Nginx >= 1.25.1.
+LISTEN_HTTPS="443 ssl http2"
 $NO_SSL && LISTEN_HTTPS="80"
 
 cat > /etc/nginx/sites-available/dialcore.conf <<NGINXEOF
@@ -529,7 +539,6 @@ fi)
 server {
     listen ${LISTEN_HTTPS};
     listen [::]:${LISTEN_HTTPS};
-    http2 on;
     server_name DOMAIN_PLACEHOLDER;
 ${SSL_BLOCK}
 
