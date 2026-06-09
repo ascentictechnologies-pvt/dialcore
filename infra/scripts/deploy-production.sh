@@ -120,11 +120,12 @@ fi
 
 mkdir -p "${BACKEND_DIR}" "${FRONTEND_DIR}"
 
-# Extract backend (build.sh packs as backend/ prefix)
+# Extract backend — auto-detect top-level folder name, strip __MACOSX entries
 info "Extracting BackEnd..."
-unzip -q -o "${TMP_DIR}/${BACKEND_ZIP}" -d "${TMP_DIR}/be"
-if [[ -d "${TMP_DIR}/be/backend" ]]; then
-  cp -r "${TMP_DIR}/be/backend/." "${BACKEND_DIR}/"
+unzip -q -o "${TMP_DIR}/${BACKEND_ZIP}" -x "__MACOSX/*" "*.DS_Store" -d "${TMP_DIR}/be"
+BE_PREFIX=$(find "${TMP_DIR}/be" -maxdepth 1 -mindepth 1 -type d ! -name '__MACOSX' | head -1)
+if [[ -n "${BE_PREFIX}" ]]; then
+  cp -r "${BE_PREFIX}/." "${BACKEND_DIR}/"
 else
   cp -r "${TMP_DIR}/be/." "${BACKEND_DIR}/"
 fi
@@ -132,11 +133,12 @@ fi
   || die "Extraction failed — DialCore.API.dll not found in ${BACKEND_DIR}"
 ok "BackEnd extracted → ${BACKEND_DIR}"
 
-# Extract frontend (build.sh packs as frontend/ prefix)
+# Extract frontend — auto-detect top-level folder name, strip __MACOSX entries
 info "Extracting FrontEnd..."
-unzip -q -o "${TMP_DIR}/${FRONTEND_ZIP}" -d "${TMP_DIR}/fe"
-if [[ -d "${TMP_DIR}/fe/frontend" ]]; then
-  cp -r "${TMP_DIR}/fe/frontend/." "${FRONTEND_DIR}/"
+unzip -q -o "${TMP_DIR}/${FRONTEND_ZIP}" -x "__MACOSX/*" "*.DS_Store" -d "${TMP_DIR}/fe"
+FE_PREFIX=$(find "${TMP_DIR}/fe" -maxdepth 1 -mindepth 1 -type d ! -name '__MACOSX' | head -1)
+if [[ -n "${FE_PREFIX}" ]]; then
+  cp -r "${FE_PREFIX}/." "${FRONTEND_DIR}/"
 else
   cp -r "${TMP_DIR}/fe/." "${FRONTEND_DIR}/"
 fi
