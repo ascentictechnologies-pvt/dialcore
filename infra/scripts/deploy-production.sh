@@ -134,11 +134,16 @@ fi
 ok "BackEnd extracted → ${BACKEND_DIR}"
 
 # Extract frontend — auto-detect top-level folder name, strip __MACOSX entries
+# Angular 17+ SSR builds output static files to a browser/ subdirectory
 info "Extracting FrontEnd..."
 unzip -q -o "${TMP_DIR}/${FRONTEND_ZIP}" -x "__MACOSX/*" "*.DS_Store" -d "${TMP_DIR}/fe"
 FE_PREFIX=$(find "${TMP_DIR}/fe" -maxdepth 1 -mindepth 1 -type d ! -name '__MACOSX' | head -1)
 if [[ -n "${FE_PREFIX}" ]]; then
-  cp -r "${FE_PREFIX}/." "${FRONTEND_DIR}/"
+  if [[ -d "${FE_PREFIX}/browser" ]]; then
+    cp -r "${FE_PREFIX}/browser/." "${FRONTEND_DIR}/"
+  else
+    cp -r "${FE_PREFIX}/." "${FRONTEND_DIR}/"
+  fi
 else
   cp -r "${TMP_DIR}/fe/." "${FRONTEND_DIR}/"
 fi
