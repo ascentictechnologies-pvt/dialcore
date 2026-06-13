@@ -26,7 +26,7 @@
 #        BackEnd/ and FrontEnd/ must be populated before running this script.
 #
 #  What this script does:
-#    1.  Installs PostgreSQL 16 + TimescaleDB 2
+#    1.  Installs PostgreSQL 18 + TimescaleDB 2
 #    2.  Installs Redis 7
 #    3.  Installs Coturn TURN/STUN
 #    4.  Installs .NET 10 ASP.NET Core Runtime
@@ -178,7 +178,7 @@ if ! $NO_SSL && ! $USE_CERTBOT && [[ -z "$CUSTOM_CERT" ]] && ! $NON_INTERACTIVE;
   esac
 fi
 
-prompt_or_default DB_PASSWORD       "PostgreSQL password"     "$(gen_secret 16)"
+prompt_or_default DB_PASSWORD       "QL password"     "$(gen_secret 16)"
 prompt_or_default REDIS_PASSWORD    "Redis auth password"     "$(gen_secret 16)"
 prompt_or_default ARI_PASSWORD      "Asterisk ARI password"   "$(gen_secret 12)"
 prompt_or_default COTURN_CREDENTIAL "Coturn TURN credential"  "$(gen_secret 16)"
@@ -220,8 +220,8 @@ apt-get install -y -qq \
   build-essential jq net-tools
 ok "Base packages installed"
 
-# ── Phase 2: PostgreSQL 16 + TimescaleDB ────────────────────────────────────
-header "Phase 3 — PostgreSQL 16 + TimescaleDB"
+# ── Phase 2: PostgreSQL 18 + TimescaleDB ────────────────────────────────────
+header "Phase 3 — PostgreSQL 18 + TimescaleDB"
 
 if systemctl is-active --quiet postgresql; then
   ok "PostgreSQL already running"
@@ -242,13 +242,13 @@ https://packagecloud.io/timescale/timescaledb/ubuntu/ ${OS_CODENAME} main" \
     > /etc/apt/sources.list.d/timescaledb.list
 
   apt-get update -qq
-  apt-get install -y -qq postgresql-16 timescaledb-2-postgresql-16
+  apt-get install -y -qq postgresql-18 timescaledb-2-postgresql-18
 
   # Auto-tune for TimescaleDB
   timescaledb-tune --quiet --yes 2>/dev/null || true
 
   systemctl enable --now postgresql
-  ok "PostgreSQL 16 + TimescaleDB installed"
+  ok "PostgreSQL 18 + TimescaleDB installed"
 fi
 
 # ── Phase 4: Redis ───────────────────────────────────────────────────────────
@@ -362,7 +362,7 @@ header "Phase 10 — PostgreSQL Database Setup"
 
 # Ensure postgres superuser can connect via Unix socket without a password prompt.
 # Default Ubuntu pg_hba.conf has peer auth, but some deployments remove it.
-PG_HBA="/etc/postgresql/16/main/pg_hba.conf"
+PG_HBA="/etc/postgresql/18/main/pg_hba.conf"
 if ! grep -qE "^local[[:space:]]+all[[:space:]]+postgres[[:space:]]+peer" "${PG_HBA}"; then
   sed -i "1s/^/local   all             postgres                                peer\n/" "${PG_HBA}"
   systemctl reload postgresql
@@ -419,7 +419,7 @@ cat > "${BACKEND_DIR}/appsettings.Production.json" <<JSONEOF
   },
   "AllowedHosts": "*",
   "ConnectionStrings": {
-    "Default": "Host=localhost;Port=5432;Database=dialcore;Username=dialcore;Password=${DB_PASSWORD};Maximum Pool Size=200;Minimum Pool Size=10;Connection Idle Lifetime=60;Command Timeout=30"
+    "Default": "Host=localhost;Port=5432;Database=dialcore;Username=postgres;Password=${DB_PASSWORD};Maximum Pool Size=200;Minimum Pool Size=10;Connection Idle Lifetime=60;Command Timeout=30"
   },
   "DIALCORE_SECRET_KEY": "${SECRET_KEY}",
   "REDIS_CONNECTION": "localhost:6379,password=${REDIS_PASSWORD},abortConnect=false",
