@@ -825,7 +825,19 @@ ok "Systemd unit '${SERVICE_NAME}' registered"
 # ── Phase 14: Asterisk (native) ──────────────────────────────────────────────
 header "Phase 14 — Asterisk (native)"
 
-apt-get install -y -qq asterisk
+apt-get install -y -qq asterisk asterisk-doc
+
+# Our asterisk.conf pins astdatadir to /var/lib/asterisk (matching an upstream from-source
+# install layout). The Debian package instead ships its version-matched XML documentation
+# under /usr/share/asterisk/documentation. If a stray from-source build (e.g. leftover
+# /usr/src/asterisk-*) previously wrote a mismatched core-en_US.xml into /var/lib/asterisk,
+# Asterisk fails to register the 'bucket' sorcery type against it and refuses to start
+# ("Bucket API initialization failed"). Always point at the package's own copy.
+if [[ -d /usr/share/asterisk/documentation ]] && \
+   [[ "$(readlink -f /var/lib/asterisk/documentation 2>/dev/null)" != "/usr/share/asterisk/documentation" ]]; then
+  rm -rf /var/lib/asterisk/documentation
+  ln -s /usr/share/asterisk/documentation /var/lib/asterisk/documentation
+fi
 
 # Copy config files into /etc/asterisk/
 for f in "${INFRA_DIR}/asterisk/"*.conf; do
