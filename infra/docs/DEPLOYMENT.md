@@ -5,8 +5,8 @@
 ```
 Internet  ──►  Nginx :443 / :80
                │
-               ├──► /api/*          ──►  .NET 10 API      :5000  (systemd)
-               ├──► /hubs/*         ──►  .NET 10 SignalR   :5000  (systemd)
+               ├──► /api/*          ──►  .NET 10 API      unix:/run/dialcore/api.sock  (systemd)
+               ├──► /hubs/*         ──►  .NET 10 SignalR   unix:/run/dialcore/api.sock  (systemd)
                └──► Angular SPA         /opt/Ascentic/Dialer/ui   (static)
 
                Nginx :8089 (TLS terminator for SIP/WebSocket)
@@ -47,7 +47,7 @@ Local services (all native — no Docker)
 | 5060 | UDP+TCP | SIP signalling |
 | 10000-10100 | UDP | RTP media |
 
-Ports 5000, 5432, 6379, 8088, 8090 are **localhost-only** — do not expose externally.
+Ports 5432, 6379, 8088, 8090 are **localhost-only** — do not expose externally. The API has no TCP port in production (Unix socket only).
 Port 8089 (Nginx SIP/WSS) must be open if WebRTC browser phones are used.
 
 ---
@@ -91,18 +91,18 @@ sudo bash infra/scripts/deploy-production.sh
 sudo bash infra/scripts/deploy-production.sh -y
 ```
 
-The script installs all dependencies, issues a Let's Encrypt TLS certificate, builds the app, configures all services, and starts everything. Credentials are saved to `/root/dialcore-credentials-<timestamp>.txt` — store them in a vault and delete the file.
+The script installs all OS dependencies, issues a TLS certificate, builds the app, and starts all services. Only the PostgreSQL password is required at install time — everything else (Asterisk ARI, Redis, SMTP, JWT, Coturn, CORS) is configured via the **Setup Wizard** on first browser login.
 
-> **Alternatively**, call the installer directly with full control over passwords:
+> **Alternatively**, call the installer directly:
 > ```bash
 > sudo bash infra/scripts/install.sh \
 >   --domain dialcore.ascentictechnologies.com \
 >   --certbot \
 >   --letsencrypt-email nageshsrivastava1988@gmail.com \
->   --db-password     "YourStrongDBPass" \
->   --redis-password  "YourRedisPass" \
->   --jwt-secret      "YourMin32CharJwtSecretKeyHere!!"
+>   --db-password "YourStrongDBPass"
 > ```
+
+After installation, open `https://<domain>` in your browser. The Setup Wizard will launch automatically and guide you through configuring Asterisk, Redis, SMTP, and Coturn. The `DIALCORE_SECRET_KEY` is auto-generated during wizard completion and emailed to `info@ascentictechnologies.com` for backup.
 
 ---
 
@@ -314,13 +314,6 @@ DOMAIN="dialcore.ascentictechnologies.com"
 
 sudo tee /opt/Ascentic/Dialer/api/appsettings.Production.json > /dev/null <<EOF
 {
-  "Kestrel": {
-    "Endpoints": {
-      "UnixSocket": {
-        "Url": "http://unix:/run/dialcore/api.sock"
-      }
-    }
-  },
   "Logging": {
     "LogLevel": {
       "Default": "Information",
@@ -388,7 +381,8 @@ TimeoutStopSec=30
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=/opt/Ascentic/Dialer/logs /opt/Ascentic/Dialer/recordings
+RuntimeDirectory=dialcore
+ReadWritePaths=/opt/Ascentic/Dialer/logs /opt/Ascentic/Dialer/recordings /run/dialcore
 ProtectHome=yes
 
 [Install]
@@ -403,6 +397,11 @@ sudo systemctl enable dialcore-api
 
 ```bash
 sudo tee /etc/nginx/sites-available/dialcore.conf > /dev/null <<'NGINXEOF'
+upstream dialcore_api {
+    server unix:/run/dialcore/api.sock;
+    keepalive 64;
+}
+
 # HTTP → HTTPS redirect
 server {
     listen 80;
@@ -453,8 +452,9 @@ server {
     }
 
     location /api/ {
-        proxy_pass         http://127.0.0.1:5000;
+        proxy_pass         http://dialcore_api;
         proxy_http_version 1.1;
+        proxy_set_header   Connection        "";
         proxy_set_header   Host              $host;
         proxy_set_header   X-Real-IP         $remote_addr;
         proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
@@ -466,7 +466,7 @@ server {
     }
 
     location /hubs/ {
-        proxy_pass         http://127.0.0.1:5000;
+        proxy_pass         http://dialcore_api;
         proxy_http_version 1.1;
         proxy_set_header   Upgrade    $http_upgrade;
         proxy_set_header   Connection "Upgrade";
@@ -477,7 +477,7 @@ server {
     }
 
     location /health {
-        proxy_pass http://127.0.0.1:5000;
+        proxy_pass http://dialcore_api;
         access_log off;
     }
 
@@ -596,8 +596,8 @@ sudo asterisk -rx "core reload"
 ## Health Checks
 
 ```bash
-# API health
-curl -sf http://localhost:5000/health
+# API health (production uses Unix socket)
+curl -sf --unix-socket /run/dialcore/api.sock http://localhost/health
 
 # PostgreSQL
 sudo -u postgres psql -c "SELECT version();"

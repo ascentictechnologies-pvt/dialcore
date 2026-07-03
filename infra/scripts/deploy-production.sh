@@ -16,6 +16,10 @@
 #  Options:
 #    --domain <value>          Server FQDN (required on first install)
 #    --secret-key <value>      AES-256 DB key — REQUIRED on redeploy to preserve data
+#    --redis-password <value>  Redis password override
+#    --ari-password <value>    Asterisk ARI password override
+#    --ami-secret <value>      Asterisk AMI secret override
+#    --coturn-credential <v>   Coturn shared credential override
 #    --ssl-cert <path>         Path to existing SSL certificate (.crt / fullchain.pem)
 #    --ssl-key  <path>         Path to existing SSL private key (.key)
 #    --certbot                 Use Let's Encrypt (requires --letsencrypt-email)
@@ -49,6 +53,10 @@ header() { echo -e "\n${BOLD}━━━  $*  ━━━${NC}"; }
 # ── Defaults ─────────────────────────────────────────────────────────────────
 DOMAIN=""
 SECRET_KEY=""
+REDIS_PASSWORD=""
+ARI_PASSWORD=""
+AMI_SECRET=""
+COTURN_CREDENTIAL=""
 USE_CERTBOT=false
 LE_EMAIL=""
 NO_SSL=false
@@ -61,6 +69,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain)             DOMAIN="$2";          shift 2 ;;
     --secret-key)         SECRET_KEY="$2";       shift 2 ;;
+    --redis-password)     REDIS_PASSWORD="$2";   shift 2 ;;
+    --ari-password)       ARI_PASSWORD="$2";     shift 2 ;;
+    --ami-secret)         AMI_SECRET="$2";       shift 2 ;;
+    --coturn-credential)  COTURN_CREDENTIAL="$2"; shift 2 ;;
     --ssl-cert)           CUSTOM_CERT="$2";       shift 2 ;;
     --ssl-key)            CUSTOM_KEY="$2";        shift 2 ;;
     --certbot)            USE_CERTBOT=true;       shift ;;
@@ -163,6 +175,10 @@ INSTALL_SCRIPT="${SCRIPT_DIR}/install.sh"
 INSTALL_ARGS=()
 [[ -n "${DOMAIN}"     ]] && INSTALL_ARGS+=(--domain "${DOMAIN}")
 [[ -n "${SECRET_KEY}" ]] && INSTALL_ARGS+=(--secret-key "${SECRET_KEY}")
+[[ -n "${REDIS_PASSWORD}" ]] && INSTALL_ARGS+=(--redis-password "${REDIS_PASSWORD}")
+[[ -n "${ARI_PASSWORD}" ]] && INSTALL_ARGS+=(--ari-password "${ARI_PASSWORD}")
+[[ -n "${AMI_SECRET}" ]] && INSTALL_ARGS+=(--ami-secret "${AMI_SECRET}")
+[[ -n "${COTURN_CREDENTIAL}" ]] && INSTALL_ARGS+=(--coturn-credential "${COTURN_CREDENTIAL}")
 [[ -n "${CUSTOM_CERT}" ]] && INSTALL_ARGS+=(--ssl-cert "${CUSTOM_CERT}")
 [[ -n "${CUSTOM_KEY}"  ]] && INSTALL_ARGS+=(--ssl-key  "${CUSTOM_KEY}")
 $USE_CERTBOT             && INSTALL_ARGS+=(--certbot)

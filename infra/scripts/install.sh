@@ -8,12 +8,13 @@
 #
 #  Options:
 #    --domain <value>          Server FQDN or IP  (required)
-#    --db-password <value>     PostgreSQL password (default: auto-generated)
-#    --redis-password <value>  Redis auth password (default: auto-generated)
-#    --ari-password <value>    Asterisk ARI password (default: auto-generated)
-#    --coturn-credential <v>   Coturn TURN credential (default: auto-generated)
-#    --jwt-secret <value>      JWT signing secret ≥32 chars (default: auto-generated)
-#    --secret-key <value>      AES-256 DB encryption key (base64 of 32 bytes). REUSE on redeploy!
+#    --db-user <value>         PostgreSQL application username (prompted if omitted)
+#    --db-password <value>     PostgreSQL password for the DB user (default: auto-generated)
+#    --secret-key <value>      Base64 32-byte DIALCORE_SECRET_KEY; preserve on redeploy
+#    --redis-password <value>  Redis password (default: preserve existing or auto-generated)
+#    --ari-password <value>    Asterisk ARI password (default: preserve existing or auto-generated)
+#    --ami-secret <value>      Asterisk AMI secret (default: preserve existing or auto-generated)
+#    --coturn-credential <v>   Coturn shared credential (default: preserve existing or auto-generated)
 #    --ssl-cert <path>         Path to existing SSL certificate (.crt / fullchain.pem)
 #    --ssl-key  <path>         Path to existing SSL private key (.key)
 #    --no-ssl                  Use HTTP only — no TLS (for LB-terminated setups)
@@ -26,7 +27,7 @@
 #        BackEnd/ and FrontEnd/ must be populated before running this script.
 #
 #  What this script does:
-#    1.  Installs PostgreSQL 18 + TimescaleDB 2
+#    1.  Installs PostgreSQL 16 + TimescaleDB 2
 #    2.  Installs Redis 7
 #    3.  Installs Coturn TURN/STUN
 #    4.  Installs .NET 10 ASP.NET Core Runtime
@@ -34,7 +35,7 @@
 #    6.  Creates system user and directory layout
 #    7.  Configures PostgreSQL database and user
 #    8.  Configures Coturn
-#    9.  Writes appsettings.Production.json
+#    9.  Writes native backend .env + appsettings.Production.json
 #    10. Generates TLS certificate (self-signed or Let's Encrypt)
 #    11. Configures Nginx
 #    12. Creates and enables systemd service
@@ -47,7 +48,6 @@ set -euo pipefail
 # ── Constants ────────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"   # infra/ root — holds asterisk/, nginx/, postgres/
-readonly INSTALL_USER="dialcore"
 readonly APP_DIR="/opt/Ascentic/Dialer"
 readonly BACKEND_DIR="${APP_DIR}/BackEnd"
 readonly FRONTEND_DIR="${APP_DIR}/FrontEnd"
@@ -67,12 +67,14 @@ die()     { err "$*"; exit 1; }
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 DOMAIN=""
+DB_USER=""
 DB_PASSWORD=""
+SECRET_KEY=""
+JWT_SECRET=""
 REDIS_PASSWORD=""
 ARI_PASSWORD=""
+AMI_SECRET=""
 COTURN_CREDENTIAL=""
-JWT_SECRET=""
-SECRET_KEY=""
 NO_SSL=false
 USE_CERTBOT=false
 LE_EMAIL=""
@@ -84,12 +86,13 @@ NON_INTERACTIVE=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --domain)             DOMAIN="$2";            shift 2 ;;
+    --db-user)            DB_USER="$2";            shift 2 ;;
     --db-password)        DB_PASSWORD="$2";        shift 2 ;;
+    --secret-key)         SECRET_KEY="$2";         shift 2 ;;
     --redis-password)     REDIS_PASSWORD="$2";     shift 2 ;;
     --ari-password)       ARI_PASSWORD="$2";       shift 2 ;;
+    --ami-secret)         AMI_SECRET="$2";         shift 2 ;;
     --coturn-credential)  COTURN_CREDENTIAL="$2";  shift 2 ;;
-    --jwt-secret)         JWT_SECRET="$2";         shift 2 ;;
-    --secret-key)         SECRET_KEY="$2";         shift 2 ;;
     --ssl-cert)           CUSTOM_CERT="$2";        shift 2 ;;
     --ssl-key)            CUSTOM_KEY="$2";         shift 2 ;;
     --no-ssl)             NO_SSL=true;             shift ;;
@@ -97,7 +100,7 @@ while [[ $# -gt 0 ]]; do
     --letsencrypt-email)  LE_EMAIL="$2";           shift 2 ;;
     -y|--yes)             NON_INTERACTIVE=true;    shift ;;
     -h|--help)
-      sed -n '8,30p' "$0" | sed 's/^#  \{0,2\}//' | sed 's/^#//'
+      sed -n '8,25p' "$0" | sed 's/^#  \{0,2\}//' | sed 's/^#//'
       exit 0 ;;
     *) die "Unknown option: $1. Run with --help." ;;
   esac
@@ -120,6 +123,12 @@ echo -e "${NC}"
 # ── Root Check ───────────────────────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || die "Run this script with sudo: sudo bash install.sh"
 
+# ── System Username Detection ─────────────────────────────────────────────────
+# SUDO_USER is set by sudo to the original invoking user; fall back to "dialcore".
+INSTALL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo "dialcore")}"
+[[ "$INSTALL_USER" == "root" ]] && INSTALL_USER="dialcore"
+info "Installation system user: ${INSTALL_USER}"
+
 # ── Ubuntu Version Check ─────────────────────────────────────────────────────
 if ! grep -qE "22\.04|24\.04" /etc/os-release 2>/dev/null; then
   warn "Tested on Ubuntu 22.04 and 24.04. Current OS may not be supported."
@@ -131,6 +140,32 @@ OS_CODENAME=$(lsb_release -cs 2>/dev/null || echo "jammy")  # jammy / noble
 
 # ── Prompt for Required Values ───────────────────────────────────────────────
 gen_secret() { openssl rand -hex "${1:-24}"; }
+gen_key()    { openssl rand -base64 32; }
+
+read_env_value() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 0
+  grep -E "^${key}=" "$file" 2>/dev/null | tail -1 | cut -d= -f2- || true
+}
+
+read_json_value() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 0
+  grep -E "\"${key}\"[[:space:]]*:" "$file" \
+    | tail -1 \
+    | sed -E 's/^[^:]+:[[:space:]]*"([^"]*)".*/\1/' \
+    || true
+}
+
+extract_redis_password() {
+  local value="$1"
+  [[ "$value" == *password=* ]] || return 0
+  printf '%s\n' "$value" | sed -E 's/^.*password=([^,]+).*$/\1/'
+}
+
+escape_sed_replacement() {
+  printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'
+}
 
 prompt_or_default() {
   local var_name="$1" prompt="$2" default="$3"
@@ -178,22 +213,57 @@ if ! $NO_SSL && ! $USE_CERTBOT && [[ -z "$CUSTOM_CERT" ]] && ! $NON_INTERACTIVE;
   esac
 fi
 
-prompt_or_default DB_PASSWORD       "QL password"     "$(gen_secret 16)"
-prompt_or_default REDIS_PASSWORD    "Redis auth password"     "$(gen_secret 16)"
-prompt_or_default ARI_PASSWORD      "Asterisk ARI password"   "$(gen_secret 12)"
-prompt_or_default COTURN_CREDENTIAL "Coturn TURN credential"  "$(gen_secret 16)"
-prompt_or_default JWT_SECRET        "JWT secret (≥32 chars)"  "$(gen_secret 32)"
-# DIALCORE_SECRET_KEY: AES-256-GCM key for column-level DB encryption.
-# MUST remain stable across redeploys — changing it makes existing encrypted rows unreadable.
-# Default: auto-generated (safe for fresh installs). Pass --secret-key to reuse an existing key.
-[[ -z "$SECRET_KEY" ]] && SECRET_KEY="$(openssl rand -base64 32)"
+# Prompt for DB username — no non-interactive default; must be supplied explicitly
+if [[ -z "$DB_USER" ]]; then
+  if $NON_INTERACTIVE; then
+    die "--db-user is required in non-interactive mode."
+  fi
+  read -rp "Enter PostgreSQL database username: " DB_USER
+  [[ -n "$DB_USER" ]] || die "Database username is required."
+fi
 
-# Ensure JWT secret is long enough
-[[ ${#JWT_SECRET} -ge 32 ]] || die "JWT_SECRET must be at least 32 characters."
+prompt_or_default DB_PASSWORD "PostgreSQL password" "$(gen_secret 16)"
+
+EXISTING_ENV_FILE="${BACKEND_DIR}/.env"
+EXISTING_APPSETTINGS="${BACKEND_DIR}/appsettings.Production.json"
+
+if [[ -z "$SECRET_KEY" ]]; then
+  SECRET_KEY="$(read_env_value "${EXISTING_ENV_FILE}" "DIALCORE_SECRET_KEY")"
+  [[ -n "$SECRET_KEY" ]] || SECRET_KEY="$(read_json_value "${EXISTING_APPSETTINGS}" "DIALCORE_SECRET_KEY")"
+  [[ -n "$SECRET_KEY" ]] || SECRET_KEY="$(gen_key)"
+fi
+
+if [[ -z "$JWT_SECRET" ]]; then
+  JWT_SECRET="$(read_env_value "${EXISTING_ENV_FILE}" "JWT_SECRET")"
+  [[ -n "$JWT_SECRET" ]] || JWT_SECRET="$(read_json_value "${EXISTING_APPSETTINGS}" "JWT_SECRET")"
+  [[ -n "$JWT_SECRET" ]] || JWT_SECRET="$(gen_secret 32)"
+fi
+
+if [[ -z "$REDIS_PASSWORD" ]]; then
+  _existing_redis="$(read_env_value "${EXISTING_ENV_FILE}" "REDIS_CONNECTION")"
+  REDIS_PASSWORD="$(extract_redis_password "${_existing_redis:-}")"
+  [[ -n "$REDIS_PASSWORD" ]] || REDIS_PASSWORD="$(gen_secret 16)"
+fi
+
+if [[ -z "$ARI_PASSWORD" ]]; then
+  ARI_PASSWORD="$(read_env_value "${EXISTING_ENV_FILE}" "ASTERISK_ARI_PASSWORD")"
+  [[ -n "$ARI_PASSWORD" ]] || ARI_PASSWORD="$(gen_secret 16)"
+fi
+
+if [[ -z "$AMI_SECRET" ]]; then
+  AMI_SECRET="$(read_env_value "${EXISTING_ENV_FILE}" "AMI_SECRET")"
+  [[ -n "$AMI_SECRET" ]] || AMI_SECRET="$(gen_secret 16)"
+fi
+
+if [[ -z "$COTURN_CREDENTIAL" ]]; then
+  COTURN_CREDENTIAL="$(read_env_value "${EXISTING_ENV_FILE}" "COTURN_CREDENTIAL")"
+  [[ -n "$COTURN_CREDENTIAL" ]] || COTURN_CREDENTIAL="$(gen_secret 16)"
+fi
 
 # ── Confirm ──────────────────────────────────────────────────────────────────
 echo ""
 echo -e "  ${BOLD}Domain:${NC}      ${DOMAIN}"
+echo -e "  ${BOLD}DB User:${NC}     ${DB_USER}"
 echo -e "  ${BOLD}BackEnd:${NC}     ${BACKEND_DIR}"
 echo -e "  ${BOLD}FrontEnd:${NC}    ${FRONTEND_DIR}"
 echo -e "  ${BOLD}SSL:${NC}         $(if $NO_SSL; then echo HTTP-only; elif [[ -n "$CUSTOM_CERT" ]]; then echo "Custom cert: $CUSTOM_CERT"; elif $USE_CERTBOT; then echo "Let's Encrypt"; else echo "Self-signed"; fi)"
@@ -217,11 +287,12 @@ apt-get install -y -qq \
   curl wget gnupg2 ca-certificates lsb-release \
   apt-transport-https software-properties-common \
   unzip git ffmpeg ufw openssl \
-  build-essential jq net-tools
+  build-essential jq net-tools \
+  unixodbc odbc-postgresql
 ok "Base packages installed"
 
-# ── Phase 2: PostgreSQL 18 + TimescaleDB ────────────────────────────────────
-header "Phase 3 — PostgreSQL 18 + TimescaleDB"
+# ── Phase 2: PostgreSQL 16 + TimescaleDB ────────────────────────────────────
+header "Phase 2 — PostgreSQL 16 + TimescaleDB"
 
 if systemctl is-active --quiet postgresql; then
   ok "PostgreSQL already running"
@@ -242,13 +313,13 @@ https://packagecloud.io/timescale/timescaledb/ubuntu/ ${OS_CODENAME} main" \
     > /etc/apt/sources.list.d/timescaledb.list
 
   apt-get update -qq
-  apt-get install -y -qq postgresql-18 timescaledb-2-postgresql-18
+  apt-get install -y -qq postgresql-16 timescaledb-2-postgresql-16
 
   # Auto-tune for TimescaleDB
   timescaledb-tune --quiet --yes 2>/dev/null || true
 
   systemctl enable --now postgresql
-  ok "PostgreSQL 18 + TimescaleDB installed"
+  ok "PostgreSQL 16 + TimescaleDB installed"
 fi
 
 # ── Phase 4: Redis ───────────────────────────────────────────────────────────
@@ -275,7 +346,8 @@ sed -i \
   "${REDIS_CONF}"
 
 # Set actual password
-sed -i "s/REDIS_PASS_PLACEHOLDER/${REDIS_PASSWORD}/g" "${REDIS_CONF}"
+REDIS_PASSWORD_SED="$(escape_sed_replacement "${REDIS_PASSWORD}")"
+sed -i "s/REDIS_PASS_PLACEHOLDER/${REDIS_PASSWORD_SED}/g" "${REDIS_CONF}"
 
 # Set maxmemory if not already set
 grep -q "^maxmemory " "${REDIS_CONF}" || echo "maxmemory 512mb" >> "${REDIS_CONF}"
@@ -341,75 +413,121 @@ apt-get install -y -qq nginx ffmpeg
 systemctl enable nginx
 ok "Nginx + ffmpeg installed"
 
-# ── Phase 9: System User and Directories ────────────────────────────────────
-header "Phase 9 — System User and Directories"
+# ── Phase 8: System User and Directories ────────────────────────────────────
+header "Phase 8 — System User and Directories"
 
 id "${INSTALL_USER}" &>/dev/null || useradd -r -s /sbin/nologin -d "${APP_DIR}" "${INSTALL_USER}"
 
 mkdir -p \
   "${BACKEND_DIR}" \
   "${FRONTEND_DIR}" \
-  "${APP_DIR}/recordings" \
-  "${APP_DIR}/logs" \
+  "${BACKEND_DIR}/recordings" \
+  "${BACKEND_DIR}/logs" \
   "${CONF_DIR}/ssl"
 
-chown -R "${INSTALL_USER}:${INSTALL_USER}" "${APP_DIR}" "${CONF_DIR}"
+# Root owns the tree; only writable runtime dirs belong to the service user
+chown -R root:root "${APP_DIR}" "${CONF_DIR}"
+chown "${INSTALL_USER}:${INSTALL_USER}" "${BACKEND_DIR}/logs" "${BACKEND_DIR}/recordings"
 chmod 750 "${CONF_DIR}"
 ok "User '${INSTALL_USER}' and directories ready"
 
-# ── Phase 10: Configure PostgreSQL ──────────────────────────────────────────
-header "Phase 10 — PostgreSQL Database Setup"
+# ── Phase 9: Configure PostgreSQL ───────────────────────────────────────────
+header "Phase 9 — PostgreSQL Database Setup"
 
 # Ensure postgres superuser can connect via Unix socket without a password prompt.
 # Default Ubuntu pg_hba.conf has peer auth, but some deployments remove it.
-PG_HBA="/etc/postgresql/18/main/pg_hba.conf"
+PG_HBA="/etc/postgresql/16/main/pg_hba.conf"
 if ! grep -qE "^local[[:space:]]+all[[:space:]]+postgres[[:space:]]+peer" "${PG_HBA}"; then
   sed -i "1s/^/local   all             postgres                                peer\n/" "${PG_HBA}"
   systemctl reload postgresql
   sleep 2
 fi
 
-# Create user and database if not exists
-sudo -u postgres psql -tc "SELECT 1 FROM pg_user WHERE usename='dialcore'" \
-  | grep -q 1 || sudo -u postgres psql \
-    -c "CREATE USER dialcore WITH PASSWORD '${DB_PASSWORD}';"
+# Create application DB role
+sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" \
+  | grep -q 1 || sudo -u postgres psql -c "CREATE USER \"${DB_USER}\" WITH PASSWORD '${DB_PASSWORD}';"
 
+# Create database if not exists
 sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='dialcore'" \
-  | grep -q 1 || sudo -u postgres psql \
-    -c "CREATE DATABASE dialcore OWNER dialcore;"
+  | grep -q 1 || sudo -u postgres psql -c "CREATE DATABASE dialcore OWNER \"${DB_USER}\";"
 
-# Enable extensions
+# Ensure ownership and grants (idempotent for re-runs)
+sudo -u postgres psql -c "ALTER DATABASE dialcore OWNER TO \"${DB_USER}\";" 2>/dev/null || true
+sudo -u postgres psql -d dialcore -c "GRANT ALL PRIVILEGES ON SCHEMA public TO \"${DB_USER}\";" 2>/dev/null || true
+
+# Enable extensions (requires superuser)
 sudo -u postgres psql -d dialcore -c \
   "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\"; CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE;" 2>/dev/null || true
 
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE dialcore TO dialcore;"
-
-# pg_hba: allow dialcore user via scram-sha-256 on localhost
-if ! grep -q "dialcore.*scram-sha-256" "${PG_HBA}"; then
-  sed -i "/^host.*all.*all.*127\.0\.0\.1.*ident/i host    dialcore        dialcore        127.0.0.1/32            scram-sha-256\nhost    dialcore        dialcore        ::1/128                 scram-sha-256" "${PG_HBA}"
+# pg_hba: allow app DB user via scram-sha-256 on localhost TCP
+if ! grep -qE "^host[[:space:]]+all[[:space:]]+${DB_USER}[[:space:]]+127" "${PG_HBA}"; then
+  sed -i "/^host.*all.*all.*127\.0\.0\.1/i host    all             ${DB_USER}        127.0.0.1/32            scram-sha-256\nhost    all             ${DB_USER}        ::1/128                 scram-sha-256" "${PG_HBA}"
   systemctl reload postgresql
 fi
 
-ok "PostgreSQL database 'dialcore' ready"
+ok "PostgreSQL database 'dialcore' ready (user: ${DB_USER})"
 
-# ── Phase 11: appsettings.Production.json ────────────────────────────────────
-header "Phase 11 — Production Configuration (appsettings.Production.json)"
+# ── ODBC DSN for Asterisk Realtime ──────────────────────────────────────────
+# Asterisk loads res_odbc.so with pre-connect=yes; without a valid DSN it crashes at startup.
+ODBC_DRIVER=$(odbcinst -q -d 2>/dev/null | grep -i postgres | head -1 | tr -d '[]' || echo "PostgreSQL Unicode")
+cat > /etc/odbc.ini <<ODBCEOF
+[dialcore]
+Driver     = ${ODBC_DRIVER}
+Servername = 127.0.0.1
+Port       = 5432
+Database   = dialcore
+UserName   = ${DB_USER}
+Password   = ${DB_PASSWORD}
+ODBCEOF
+chmod 640 /etc/odbc.ini
+ok "ODBC DSN 'dialcore' written to /etc/odbc.ini (driver: ${ODBC_DRIVER})"
+
+# ── Phase 10: Native Runtime Configuration ──────────────────────────────────
+header "Phase 10 — Native Runtime Configuration"
 
 PROTOCOL="https"
 $NO_SSL && PROTOCOL="http"
+REDIS_CONNECTION="localhost:6379,password=${REDIS_PASSWORD},abortConnect=false"
 
-# Written to APP_DIR/api/ after publish (Phase 12) so dotnet publish cannot overwrite it.
-# The source-tree appsettings.Production.json is a blank template; this is the real one.
+# Written after artifact deployment so dotnet publish cannot overwrite these files.
+# The source-tree appsettings.Production.json is a blank template; these are the real values.
+write_backend_env() {
+cat > "${BACKEND_DIR}/.env" <<ENVEOF
+ASPNETCORE_ENVIRONMENT=Production
+REDIS_CONNECTION=${REDIS_CONNECTION}
+JWT_SECRET=${JWT_SECRET}
+JWT_ISSUER=dialcore
+JWT_AUDIENCE=dialcore-api
+JWT_EXPIRY_MINUTES=60
+DIALCORE_SECRET_KEY=${SECRET_KEY}
+ASTERISK_ARI_URL=http://localhost:8088
+ASTERISK_ARI_USER=dialcore
+ASTERISK_ARI_PASSWORD=${ARI_PASSWORD}
+ASTERISK_ARI_APP=dialcore
+AMI_ENABLED=false
+AMI_HOST=localhost
+AMI_PORT=5038
+AMI_USERNAME=dialcore
+AMI_SECRET=${AMI_SECRET}
+AMI_RECONNECT_BACKOFF_SECONDS=5
+COTURN_URL=turn:${DOMAIN}:3478
+COTURN_USER=dialcore
+COTURN_CREDENTIAL=${COTURN_CREDENTIAL}
+RECORDING_STORAGE_TYPE=local
+RECORDING_LOCAL_PATH=${BACKEND_DIR}/recordings
+CORS_ORIGINS=${PROTOCOL}://${DOMAIN},http://localhost,http://localhost:4300
+DIALCORE_RUN_API=true
+DIALCORE_RUN_WORKERS=true
+DIALCORE_WORKER_ROLES=all
+DIALCORE_RUN_MIGRATIONS=true
+ENVEOF
+chmod 640 "${BACKEND_DIR}/.env"
+chown root:"${INSTALL_USER}" "${BACKEND_DIR}/.env"
+}
+
 write_appsettings() {
 cat > "${BACKEND_DIR}/appsettings.Production.json" <<JSONEOF
 {
-  "Kestrel": {
-    "Endpoints": {
-      "UnixSocket": {
-        "Url": "http://unix:/run/dialcore/api.sock"
-      }
-    }
-  },
   "Logging": {
     "LogLevel": {
       "Default": "Information",
@@ -419,38 +537,42 @@ cat > "${BACKEND_DIR}/appsettings.Production.json" <<JSONEOF
   },
   "AllowedHosts": "*",
   "ConnectionStrings": {
-    "Default": "Host=localhost;Port=5432;Database=dialcore;Username=postgres;Password=${DB_PASSWORD};Maximum Pool Size=200;Minimum Pool Size=10;Connection Idle Lifetime=60;Command Timeout=30"
+    "Default": "Host=localhost;Port=5432;Database=dialcore;Username=${DB_USER};Password=${DB_PASSWORD};Maximum Pool Size=200;Minimum Pool Size=10;Connection Idle Lifetime=60;Command Timeout=30"
   },
-  "DIALCORE_SECRET_KEY": "${SECRET_KEY}",
-  "REDIS_CONNECTION": "localhost:6379,password=${REDIS_PASSWORD},abortConnect=false",
-  "ASTERISK_ARI_URL": "http://localhost:8088",
-  "ASTERISK_ARI_USER": "dialcore",
-  "ASTERISK_ARI_PASSWORD": "${ARI_PASSWORD}",
-  "ASTERISK_ARI_APP": "dialcore",
+  "REDIS_CONNECTION": "${REDIS_CONNECTION}",
   "JWT_SECRET": "${JWT_SECRET}",
   "JWT_ISSUER": "dialcore",
   "JWT_AUDIENCE": "dialcore-api",
   "JWT_EXPIRY_MINUTES": "60",
-  "CORS_ORIGINS": "${PROTOCOL}://${DOMAIN}",
-  "RECORDING_STORAGE_TYPE": "local",
-  "RECORDING_LOCAL_PATH": "${APP_DIR}/recordings",
+  "DIALCORE_SECRET_KEY": "${SECRET_KEY}",
+  "ASTERISK_ARI_URL": "http://localhost:8088",
+  "ASTERISK_ARI_USER": "dialcore",
+  "ASTERISK_ARI_PASSWORD": "${ARI_PASSWORD}",
+  "ASTERISK_ARI_APP": "dialcore",
+  "AMI_ENABLED": "false",
+  "AMI_HOST": "localhost",
+  "AMI_PORT": "5038",
+  "AMI_USERNAME": "dialcore",
+  "AMI_SECRET": "${AMI_SECRET}",
+  "AMI_RECONNECT_BACKOFF_SECONDS": "5",
   "COTURN_URL": "turn:${DOMAIN}:3478",
   "COTURN_USER": "dialcore",
   "COTURN_CREDENTIAL": "${COTURN_CREDENTIAL}",
-  "LOG_FILE_PATH": "${APP_DIR}/logs/dialcore-",
-  "LOG_FILE_MAX_SIZE_MB": "50",
-  "LOG_FILE_RETAIN_DAYS": "30"
+  "RECORDING_STORAGE_TYPE": "local",
+  "RECORDING_LOCAL_PATH": "${BACKEND_DIR}/recordings",
+  "CORS_ORIGINS": "${PROTOCOL}://${DOMAIN},http://localhost,http://localhost:4300"
 }
 JSONEOF
 chmod 640 "${BACKEND_DIR}/appsettings.Production.json"
 chown root:"${INSTALL_USER}" "${BACKEND_DIR}/appsettings.Production.json"
 }
 
+write_backend_env
 write_appsettings
-ok "appsettings.Production.json written to ${BACKEND_DIR}/"
+ok "Native runtime .env and appsettings.Production.json written to ${BACKEND_DIR}/"
 
-# ── Phase 12: TLS Certificate ────────────────────────────────────────────────
-header "Phase 12 — TLS Certificate"
+# ── Phase 11: TLS Certificate ────────────────────────────────────────────────
+header "Phase 11 — TLS Certificate"
 
 SSL_CRT="${CONF_DIR}/ssl/dialcore.crt"
 SSL_KEY="${CONF_DIR}/ssl/dialcore.key"
@@ -501,8 +623,8 @@ fi
 chown root:"${INSTALL_USER}" "${SSL_CRT}" "${SSL_KEY}" 2>/dev/null || true
 chmod 640 "${SSL_KEY}"
 
-# ── Phase 13: Nginx Configuration ───────────────────────────────────────────
-header "Phase 13 — Nginx Configuration"
+# ── Phase 12: Nginx Configuration ───────────────────────────────────────────
+header "Phase 12 — Nginx Configuration"
 
 SSL_BLOCK=""
 if ! $NO_SSL; then
@@ -602,6 +724,12 @@ ${SSL_BLOCK}
         access_log off;
     }
 
+    location = /nginx-health {
+        access_log off;
+        add_header Content-Type text/plain;
+        return 200 "ok\n";
+    }
+
     # SPA fallback
     location / {
         try_files \$uri \$uri/ /index.html;
@@ -645,8 +773,8 @@ rm -f /etc/nginx/sites-enabled/default
 nginx -t || die "Nginx config test failed. Check /etc/nginx/sites-available/dialcore.conf"
 ok "Nginx configured for ${DOMAIN}"
 
-# ── Phase 14: Systemd Service ────────────────────────────────────────────────
-header "Phase 14 — Systemd Service"
+# ── Phase 13: Systemd Service ────────────────────────────────────────────────
+header "Phase 13 — Systemd Service"
 
 cat > /etc/systemd/system/${SERVICE_NAME}.service <<UNITEOF
 [Unit]
@@ -660,6 +788,8 @@ Type=simple
 User=${INSTALL_USER}
 Group=${INSTALL_USER}
 WorkingDirectory=${BACKEND_DIR}
+ExecStartPre=+/bin/mkdir -p ${BACKEND_DIR}/logs ${BACKEND_DIR}/recordings
+ExecStartPre=+/bin/chown ${INSTALL_USER}:${INSTALL_USER} ${BACKEND_DIR}/logs ${BACKEND_DIR}/recordings
 ExecStart=/usr/bin/dotnet ${BACKEND_DIR}/DialCore.API.dll
 Restart=on-failure
 RestartSec=5
@@ -667,6 +797,7 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=${SERVICE_NAME}
 Environment=ASPNETCORE_ENVIRONMENT=Production
+EnvironmentFile=${BACKEND_DIR}/.env
 KillMode=mixed
 KillSignal=SIGTERM
 TimeoutStopSec=30
@@ -680,7 +811,7 @@ RuntimeDirectoryMode=0750
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=${APP_DIR}/logs ${APP_DIR}/recordings
+ReadWritePaths=${BACKEND_DIR}/logs ${BACKEND_DIR}/recordings
 ProtectHome=yes
 
 [Install]
@@ -691,19 +822,21 @@ systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
 ok "Systemd unit '${SERVICE_NAME}' registered"
 
-# ── Phase 15: Asterisk (native) ──────────────────────────────────────────────
-header "Phase 15 — Asterisk (native)"
+# ── Phase 14: Asterisk (native) ──────────────────────────────────────────────
+header "Phase 14 — Asterisk (native)"
 
 apt-get install -y -qq asterisk
-
-# Stamp ARI password into our config files before copying
-ARI_CONF="${INFRA_DIR}/asterisk/ari.conf"
-[[ -f "${ARI_CONF}" ]] && sed -i "s/^password = .*/password = ${ARI_PASSWORD}/" "${ARI_CONF}"
 
 # Copy config files into /etc/asterisk/
 for f in "${INFRA_DIR}/asterisk/"*.conf; do
   cp "$f" "/etc/asterisk/$(basename "$f")"
 done
+
+# Stamp generated credentials into the installed Asterisk configs, never the source files.
+ARI_PASSWORD_SED="$(escape_sed_replacement "${ARI_PASSWORD}")"
+AMI_SECRET_SED="$(escape_sed_replacement "${AMI_SECRET}")"
+[[ -f "/etc/asterisk/ari.conf" ]] && sed -i "s/^password = .*/password = ${ARI_PASSWORD_SED}/" "/etc/asterisk/ari.conf"
+[[ -f "/etc/asterisk/manager.conf" ]] && sed -i "s/^secret = .*/secret = ${AMI_SECRET_SED}/" "/etc/asterisk/manager.conf"
 
 # Fix ownership (asterisk system user is created by the package)
 chown -R asterisk:asterisk /etc/asterisk/ /var/spool/asterisk/ \
@@ -712,8 +845,8 @@ chown -R asterisk:asterisk /etc/asterisk/ /var/spool/asterisk/ \
 systemctl enable asterisk
 ok "Asterisk installed (native systemd)"
 
-# ── Phase 16: UFW Firewall ───────────────────────────────────────────────────
-header "Phase 16 — UFW Firewall"
+# ── Phase 15: UFW Firewall ───────────────────────────────────────────────────
+header "Phase 15 — UFW Firewall"
 
 ufw --force reset > /dev/null
 ufw default deny incoming > /dev/null
@@ -729,8 +862,8 @@ ufw allow 10000:10100/udp comment "RTP media"
 ufw --force enable > /dev/null
 ok "Firewall configured ($(ufw status | grep -c ALLOW) rules)"
 
-# ── Phase 17: Start All Services ────────────────────────────────────────────
-header "Phase 17 — Starting Services"
+# ── Phase 16: Start All Services ────────────────────────────────────────────
+header "Phase 16 — Starting Services"
 
 systemctl start postgresql
 systemctl start redis-server
@@ -741,8 +874,8 @@ systemctl reload nginx
 
 ok "All services started"
 
-# ── Phase 18: Health Checks ──────────────────────────────────────────────────
-header "Phase 18 — Health Checks"
+# ── Phase 17: Health Checks ──────────────────────────────────────────────────
+header "Phase 17 — Health Checks"
 
 _pass=0; _fail=0
 
@@ -760,9 +893,9 @@ check() {
 sleep 8  # give API time to start and run migrations
 
 check "PostgreSQL"      "sudo -u postgres psql -c 'SELECT 1' > /dev/null"
-check "Redis"           "redis-cli -a '${REDIS_PASSWORD}' ping | grep -q PONG"
+check "Redis"           "systemctl is-active --quiet redis-server"
 check "Coturn"          "systemctl is-active --quiet coturn"
-check "Asterisk"        "systemctl is-active --quiet asterisk && curl -sf -u dialcore:'${ARI_PASSWORD}' http://localhost:8088/ari/asterisk/info"
+check "Asterisk"        "systemctl is-active --quiet asterisk"
 check "API /health"     "curl -sf --unix-socket /run/dialcore/api.sock http://localhost/health"
 check "Nginx"           "curl -sf -k https://localhost/nginx-health 2>/dev/null || curl -sf http://localhost/nginx-health"
 
@@ -787,7 +920,7 @@ echo -e "  ${DIM}  sudo systemctl status dialcore-api${NC}"
 echo -e "  ${DIM}  sudo journalctl -u dialcore-api -f${NC}"
 echo -e "  ${DIM}  sudo journalctl -u asterisk -f${NC}"
 echo -e "  ${DIM}  sudo tail -f /var/log/asterisk/messages${NC}"
-echo -e "  ${DIM}  sudo tail -f ${APP_DIR}/logs/dialcore-*.log${NC}"
+echo -e "  ${DIM}  sudo tail -f ${BACKEND_DIR}/logs/dialcore-*.log${NC}"
 echo ""
 
 if [[ ! $NO_SSL && ! $USE_CERTBOT ]]; then
@@ -796,10 +929,15 @@ if [[ ! $NO_SSL && ! $USE_CERTBOT ]]; then
   echo ""
 fi
 
+echo -e "  ${YELLOW}NEXT STEP: Open ${PROTOCOL}://${DOMAIN} and complete the Setup Wizard.${NC}"
+echo -e "  ${YELLOW}  Redis, JWT, Coturn, and local Asterisk bootstrap values were generated by this installer.${NC}"
+echo -e "  ${YELLOW}  The wizard can update runtime service settings after first login.${NC}"
+echo ""
+
 # Save credentials to a local summary file
 CREDS_FILE="/root/dialcore-credentials-$(date +%Y%m%d%H%M%S).txt"
 cat > "${CREDS_FILE}" <<CREDSEOF
-DialCore Installation Credentials — $(date)
+DialCore Installation — $(date)
 Keep this file secure. Delete after storing in a password manager.
 
 Domain:             ${DOMAIN}
@@ -808,29 +946,38 @@ App URL:            ${PROTOCOL}://${DOMAIN}
 PostgreSQL:
   Host:             localhost:5432
   Database:         dialcore
-  User:             dialcore
+  User:             ${DB_USER}
   Password:         ${DB_PASSWORD}
 
 Redis:
-  Host:             localhost:6379
-  Password:         ${REDIS_PASSWORD}
+  Connection:       ${REDIS_CONNECTION}
 
-Asterisk ARI:
-  URL:              http://localhost:8088
-  User:             dialcore
-  Password:         ${ARI_PASSWORD}
+Asterisk:
+  ARI URL:          http://localhost:8088
+  ARI User:         dialcore
+  ARI Password:     ${ARI_PASSWORD}
+  AMI Host:         localhost:5038
+  AMI User:         dialcore
+  AMI Secret:       ${AMI_SECRET}
 
 Coturn:
   URL:              turn:${DOMAIN}:3478
   User:             dialcore
   Credential:       ${COTURN_CREDENTIAL}
 
-JWT Secret:         ${JWT_SECRET}
+API Secrets:
+  JWT_SECRET:       ${JWT_SECRET}
+  DIALCORE_SECRET_KEY:
+                    ${SECRET_KEY}
 
-AES Secret Key:     ${SECRET_KEY}
-  !! KEEP THIS KEY. Losing it makes encrypted DB columns permanently unreadable. !!
-
+Runtime env:        ${BACKEND_DIR}/.env
 Config file:        ${BACKEND_DIR}/appsettings.Production.json
+Logs:               ${BACKEND_DIR}/logs/
+Recordings:         ${BACKEND_DIR}/recordings/
+
+NOTE: SMTP, SMS, and any external service credentials are configured via the
+      Setup Wizard (${PROTOCOL}://${DOMAIN}). Preserve DIALCORE_SECRET_KEY
+      on every redeploy or encrypted database values will become unreadable.
 CREDSEOF
 chmod 600 "${CREDS_FILE}"
 echo -e "  ${BOLD}Credentials saved to:${NC} ${CREDS_FILE}"
