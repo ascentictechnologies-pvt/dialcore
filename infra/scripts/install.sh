@@ -282,7 +282,7 @@ fi
 header "Phase 1 — System Packages"
 
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
+apt-get update -qq || warn "apt-get update reported errors (possibly stale/broken third-party repos already configured on this host) — continuing"
 apt-get install -y -qq \
   curl wget gnupg2 ca-certificates lsb-release \
   apt-transport-https software-properties-common \
@@ -312,7 +312,7 @@ https://apt.postgresql.org/pub/repos/apt ${OS_CODENAME}-pgdg main" \
 https://packagecloud.io/timescale/timescaledb/ubuntu/ ${OS_CODENAME} main" \
     > /etc/apt/sources.list.d/timescaledb.list
 
-  apt-get update -qq
+  apt-get update -qq || warn "apt-get update reported errors (possibly stale/broken third-party repos already configured on this host) — continuing"
   apt-get install -y -qq postgresql-16 timescaledb-2-postgresql-16
 
   # Auto-tune for TimescaleDB
@@ -400,7 +400,7 @@ else
 https://packages.microsoft.com/ubuntu/${OS_VER}/prod ${OS_CODENAME} main" \
     > /etc/apt/sources.list.d/microsoft-prod.list
 
-  apt-get update -qq
+  apt-get update -qq || warn "apt-get update reported errors (possibly stale/broken third-party repos already configured on this host) — continuing"
   # Runtime only — no SDK needed, app is pre-compiled
   apt-get install -y -qq aspnetcore-runtime-10.0
   ok ".NET ASP.NET Core Runtime $(dotnet --version) installed"
