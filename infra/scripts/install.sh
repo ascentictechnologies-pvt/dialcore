@@ -42,6 +42,7 @@
 #    13. Installs and configures Asterisk
 #    14. Configures UFW firewall
 #    15. Starts all services and runs health checks
+#    16. Records installer-owned components to /etc/ascentic/dialer/installed-components.list
 # ============================================================
 set -euo pipefail
 
@@ -52,6 +53,7 @@ readonly APP_DIR="/opt/Ascentic/Dialer"
 readonly BACKEND_DIR="${APP_DIR}/BackEnd"
 readonly FRONTEND_DIR="${APP_DIR}/FrontEnd"
 readonly CONF_DIR="/etc/ascentic/dialer"
+readonly COMPONENT_MANIFEST="${CONF_DIR}/installed-components.list"
 readonly SERVICE_NAME="dialcore-api"
 
 # ── Colours ──────────────────────────────────────────────────────────────────
@@ -64,6 +66,24 @@ warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()     { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 header()  { echo -e "\n${BOLD}━━━  $*  ━━━${NC}"; }
 die()     { err "$*"; exit 1; }
+
+package_installed() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "install ok installed"
+}
+
+init_component_manifest() {
+  mkdir -p "${CONF_DIR}"
+  touch "${COMPONENT_MANIFEST}"
+  chmod 600 "${COMPONENT_MANIFEST}"
+}
+
+record_component() {
+  local component="$1"
+  mkdir -p "${CONF_DIR}"
+  touch "${COMPONENT_MANIFEST}"
+  chmod 600 "${COMPONENT_MANIFEST}"
+  grep -qxF "${component}" "${COMPONENT_MANIFEST}" 2>/dev/null || echo "${component}" >> "${COMPONENT_MANIFEST}"
+}
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 DOMAIN=""
@@ -278,6 +298,10 @@ if ! $NON_INTERACTIVE; then
   [[ "${_confirm:-y}" =~ ^[Yy]$ ]] || die "Aborted."
 fi
 
+init_component_manifest
+record_component "manifest:${COMPONENT_MANIFEST}"
+record_component "config_dir:${CONF_DIR}"
+
 # ── Phase 1: System Packages ─────────────────────────────────────────────────
 header "Phase 1 — System Packages"
 
@@ -294,6 +318,10 @@ ok "Base packages installed"
 # ── Phase 2: PostgreSQL 16 + TimescaleDB ────────────────────────────────────
 header "Phase 2 — PostgreSQL 16 + TimescaleDB"
 
+POSTGRES_WAS_INSTALLED=false
+TIMESCALE_WAS_INSTALLED=false
+package_installed postgresql-16 && POSTGRES_WAS_INSTALLED=true
+package_installed timescaledb-2-postgresql-16 && TIMESCALE_WAS_INSTALLED=true
 if systemctl is-active --quiet postgresql; then
   ok "PostgreSQL already running"
 else
@@ -314,6 +342,12 @@ https://packagecloud.io/timescale/timescaledb/ubuntu/ ${OS_CODENAME} main" \
 
   apt-get update -qq || warn "apt-get update reported errors (possibly stale/broken third-party repos already configured on this host) — continuing"
   apt-get install -y -qq postgresql-16 timescaledb-2-postgresql-16
+  $POSTGRES_WAS_INSTALLED || record_component "package:postgresql-16"
+  $TIMESCALE_WAS_INSTALLED || record_component "package:timescaledb-2-postgresql-16"
+  record_component "apt_repo:/etc/apt/sources.list.d/postgresql.list"
+  record_component "apt_repo:/etc/apt/sources.list.d/timescaledb.list"
+  record_component "apt_key:/etc/apt/keyrings/postgresql.gpg"
+  record_component "apt_key:/etc/apt/keyrings/timescaledb.gpg"
 
   # Auto-tune for TimescaleDB
   timescaledb-tune --quiet --yes 2>/dev/null || true
@@ -325,10 +359,13 @@ fi
 # ── Phase 4: Redis ───────────────────────────────────────────────────────────
 header "Phase 4 — Redis 7"
 
+REDIS_WAS_INSTALLED=false
+package_installed redis-server && REDIS_WAS_INSTALLED=true
 if systemctl is-active --quiet redis-server 2>/dev/null; then
   ok "Redis already running"
 else
   apt-get install -y -qq redis-server
+  $REDIS_WAS_INSTALLED || record_component "package:redis-server"
   systemctl enable redis-server
   ok "Redis installed"
 fi
@@ -353,12 +390,16 @@ sed -i "s/REDIS_PASS_PLACEHOLDER/${REDIS_PASSWORD_SED}/g" "${REDIS_CONF}"
 grep -q "^maxmemory " "${REDIS_CONF}" || echo "maxmemory 512mb" >> "${REDIS_CONF}"
 
 systemctl restart redis-server
+record_component "config:/etc/redis/redis.conf"
 ok "Redis configured (auth + memory policy)"
 
 # ── Phase 5: Coturn ──────────────────────────────────────────────────────────
 header "Phase 5 — Coturn TURN/STUN"
 
+COTURN_WAS_INSTALLED=false
+package_installed coturn && COTURN_WAS_INSTALLED=true
 apt-get install -y -qq coturn
+$COTURN_WAS_INSTALLED || record_component "package:coturn"
 
 # Enable daemon
 sed -i 's/^#TURNSERVER_ENABLED=1/TURNSERVER_ENABLED=1/' /etc/default/coturn 2>/dev/null \
@@ -384,11 +425,14 @@ denied-peer-ip=100.64.0.0-100.127.255.255
 TURNEOF
 
 systemctl enable --now coturn
+record_component "config:/etc/turnserver.conf"
 ok "Coturn configured (realm=${DOMAIN})"
 
 # ── Phase 6: .NET 10 ASP.NET Core Runtime ────────────────────────────────────
 header "Phase 6 — .NET 10 ASP.NET Core Runtime"
 
+DOTNET_WAS_INSTALLED=false
+package_installed aspnetcore-runtime-10.0 && DOTNET_WAS_INSTALLED=true
 if dotnet --version 2>/dev/null | grep -q "^10\."; then
   ok ".NET 10 already installed"
 else
@@ -403,20 +447,32 @@ https://packages.microsoft.com/ubuntu/${OS_VER}/prod ${OS_CODENAME} main" \
   apt-get update -qq || warn "apt-get update reported errors (possibly stale/broken third-party repos already configured on this host) — continuing"
   # Runtime only — no SDK needed, app is pre-compiled
   apt-get install -y -qq aspnetcore-runtime-10.0
+  $DOTNET_WAS_INSTALLED || record_component "package:aspnetcore-runtime-10.0"
+  record_component "apt_repo:/etc/apt/sources.list.d/microsoft-prod.list"
+  record_component "apt_key:/etc/apt/keyrings/microsoft.gpg"
   ok ".NET ASP.NET Core Runtime $(dotnet --version) installed"
 fi
 
 # ── Phase 7: Nginx + ffmpeg ───────────────────────────────────────────────────
 header "Phase 7 — Nginx + ffmpeg"
 
+NGINX_WAS_INSTALLED=false
+FFMPEG_WAS_INSTALLED=false
+package_installed nginx && NGINX_WAS_INSTALLED=true
+package_installed ffmpeg && FFMPEG_WAS_INSTALLED=true
 apt-get install -y -qq nginx ffmpeg
+$NGINX_WAS_INSTALLED || record_component "package:nginx"
+$FFMPEG_WAS_INSTALLED || record_component "package:ffmpeg"
 systemctl enable nginx
 ok "Nginx + ffmpeg installed"
 
 # ── Phase 8: System User and Directories ────────────────────────────────────
 header "Phase 8 — System User and Directories"
 
-id "${INSTALL_USER}" &>/dev/null || useradd -r -s /sbin/nologin -d "${APP_DIR}" "${INSTALL_USER}"
+if ! id "${INSTALL_USER}" &>/dev/null; then
+  useradd -r -s /sbin/nologin -d "${APP_DIR}" "${INSTALL_USER}"
+  record_component "system_user:${INSTALL_USER}"
+fi
 
 mkdir -p \
   "${BACKEND_DIR}" \
@@ -429,6 +485,9 @@ mkdir -p \
 chown -R root:root "${APP_DIR}" "${CONF_DIR}"
 chown "${INSTALL_USER}:${INSTALL_USER}" "${BACKEND_DIR}/logs" "${BACKEND_DIR}/recordings"
 chmod 750 "${CONF_DIR}"
+record_component "app_dir:${APP_DIR}"
+record_component "runtime_dir:${BACKEND_DIR}/logs"
+record_component "runtime_dir:${BACKEND_DIR}/recordings"
 ok "User '${INSTALL_USER}' and directories ready"
 
 # ── Phase 9: Configure PostgreSQL ───────────────────────────────────────────
@@ -444,12 +503,20 @@ if ! grep -qE "^local[[:space:]]+all[[:space:]]+postgres[[:space:]]+peer" "${PG_
 fi
 
 # Create application DB role
-sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" \
-  | grep -q 1 || sudo -u postgres psql -c "CREATE USER \"${DB_USER}\" WITH PASSWORD '${DB_PASSWORD}';"
+if sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" | grep -q 1; then
+  :
+else
+  sudo -u postgres psql -c "CREATE USER \"${DB_USER}\" WITH PASSWORD '${DB_PASSWORD}';"
+  record_component "db_role:${DB_USER}"
+fi
 
 # Create database if not exists
-sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='dialcore'" \
-  | grep -q 1 || sudo -u postgres psql -c "CREATE DATABASE dialcore OWNER \"${DB_USER}\";"
+if sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='dialcore'" | grep -q 1; then
+  :
+else
+  sudo -u postgres psql -c "CREATE DATABASE dialcore OWNER \"${DB_USER}\";"
+  record_component "database:dialcore"
+fi
 
 # Ensure ownership and grants (idempotent for re-runs)
 sudo -u postgres psql -c "ALTER DATABASE dialcore OWNER TO \"${DB_USER}\";" 2>/dev/null || true
@@ -480,6 +547,7 @@ UserName   = ${DB_USER}
 Password   = ${DB_PASSWORD}
 ODBCEOF
 chmod 640 /etc/odbc.ini
+record_component "config:/etc/odbc.ini"
 ok "ODBC DSN 'dialcore' written to /etc/odbc.ini (driver: ${ODBC_DRIVER})"
 
 # ── Phase 10: Native Runtime Configuration ──────────────────────────────────
@@ -569,6 +637,8 @@ chown root:"${INSTALL_USER}" "${BACKEND_DIR}/appsettings.Production.json"
 
 write_backend_env
 write_appsettings
+record_component "config:${BACKEND_DIR}/.env"
+record_component "config:${BACKEND_DIR}/appsettings.Production.json"
 ok "Native runtime .env and appsettings.Production.json written to ${BACKEND_DIR}/"
 
 # ── Phase 11: TLS Certificate ────────────────────────────────────────────────
@@ -587,11 +657,19 @@ elif [[ -n "$CUSTOM_CERT" ]]; then
 
   cp "${CUSTOM_CERT}" "${SSL_CRT}"
   cp "${CUSTOM_KEY}"  "${SSL_KEY}"
+  record_component "ssl_cert:${SSL_CRT}"
+  record_component "ssl_key:${SSL_KEY}"
   ok "Custom SSL certificate installed from ${CUSTOM_CERT}"
 elif $USE_CERTBOT; then
   # ── Let's Encrypt ──────────────────────────────────────────────────────────
   [[ -n "$LE_EMAIL" ]] || die "Provide --letsencrypt-email for Let's Encrypt."
+  CERTBOT_WAS_INSTALLED=false
+  CERTBOT_NGINX_WAS_INSTALLED=false
+  package_installed certbot && CERTBOT_WAS_INSTALLED=true
+  package_installed python3-certbot-nginx && CERTBOT_NGINX_WAS_INSTALLED=true
   apt-get install -y -qq certbot python3-certbot-nginx
+  $CERTBOT_WAS_INSTALLED || record_component "package:certbot"
+  $CERTBOT_NGINX_WAS_INSTALLED || record_component "package:python3-certbot-nginx"
 
   mkdir -p /var/www/certbot
   cat > /etc/nginx/sites-available/certbot-temp.conf <<'CERTEOF'
@@ -606,9 +684,13 @@ CERTEOF
   ln -sf "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" "${SSL_CRT}"
   ln -sf "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"   "${SSL_KEY}"
   rm -f /etc/nginx/sites-enabled/certbot-temp.conf
+  rm -f /etc/nginx/sites-available/certbot-temp.conf
 
   systemctl enable --now certbot.timer 2>/dev/null \
     || (crontab -l 2>/dev/null; echo "0 0,12 * * * certbot renew --quiet") | crontab -
+  record_component "certbot_cert:${DOMAIN}"
+  record_component "ssl_cert:${SSL_CRT}"
+  record_component "ssl_key:${SSL_KEY}"
   ok "Let's Encrypt certificate issued for ${DOMAIN}"
 else
   # ── Self-signed fallback ────────────────────────────────────────────────────
@@ -617,6 +699,8 @@ else
     -out    "${SSL_CRT}" \
     -subj   "/C=US/ST=State/L=City/O=DialCore/CN=${DOMAIN}" \
     2>/dev/null
+  record_component "ssl_cert:${SSL_CRT}"
+  record_component "ssl_key:${SSL_KEY}"
   ok "Self-signed certificate generated (365 days)"
 fi
 
@@ -771,6 +855,8 @@ ln -sf /etc/nginx/sites-available/dialcore.conf /etc/nginx/sites-enabled/dialcor
 rm -f /etc/nginx/sites-enabled/default
 
 nginx -t || die "Nginx config test failed. Check /etc/nginx/sites-available/dialcore.conf"
+record_component "nginx_site:/etc/nginx/sites-available/dialcore.conf"
+record_component "nginx_site:/etc/nginx/sites-enabled/dialcore.conf"
 ok "Nginx configured for ${DOMAIN}"
 
 # ── Phase 13: Systemd Service ────────────────────────────────────────────────
@@ -820,12 +906,19 @@ UNITEOF
 
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}"
+record_component "systemd_unit:/etc/systemd/system/${SERVICE_NAME}.service"
 ok "Systemd unit '${SERVICE_NAME}' registered"
 
 # ── Phase 14: Asterisk (native) ──────────────────────────────────────────────
 header "Phase 14 — Asterisk (native)"
 
+ASTERISK_WAS_INSTALLED=false
+ASTERISK_DOC_WAS_INSTALLED=false
+package_installed asterisk && ASTERISK_WAS_INSTALLED=true
+package_installed asterisk-doc && ASTERISK_DOC_WAS_INSTALLED=true
 apt-get install -y -qq asterisk asterisk-doc
+$ASTERISK_WAS_INSTALLED || record_component "package:asterisk"
+$ASTERISK_DOC_WAS_INSTALLED || record_component "package:asterisk-doc"
 
 # Our asterisk.conf pins astdatadir to /var/lib/asterisk (matching an upstream from-source
 # install layout). The Debian package instead ships its version-matched XML documentation
@@ -842,6 +935,7 @@ fi
 # Copy config files into /etc/asterisk/
 for f in "${INFRA_DIR}/asterisk/"*.conf; do
   cp "$f" "/etc/asterisk/$(basename "$f")"
+  record_component "asterisk_config:/etc/asterisk/$(basename "$f")"
 done
 
 # Stamp generated credentials into the installed Asterisk configs, never the source files.
@@ -872,6 +966,11 @@ ufw allow 5060/udp  comment "SIP UDP"
 ufw allow 5060/tcp  comment "SIP TCP"
 ufw allow 10000:10100/udp comment "RTP media"
 ufw --force enable > /dev/null
+record_component "ufw_rule:3478/udp"
+record_component "ufw_rule:3478/tcp"
+record_component "ufw_rule:5060/udp"
+record_component "ufw_rule:5060/tcp"
+record_component "ufw_rule:10000:10100/udp"
 ok "Firewall configured ($(ufw status | grep -c ALLOW) rules)"
 
 # ── Phase 16: Start All Services ────────────────────────────────────────────
@@ -992,6 +1091,8 @@ NOTE: SMTP, SMS, and any external service credentials are configured via the
       on every redeploy or encrypted database values will become unreadable.
 CREDSEOF
 chmod 600 "${CREDS_FILE}"
+record_component "credentials:${CREDS_FILE}"
 echo -e "  ${BOLD}Credentials saved to:${NC} ${CREDS_FILE}"
+echo -e "  ${BOLD}Installed components:${NC} ${COMPONENT_MANIFEST}"
 echo -e "  ${RED}  Delete this file after storing passwords in a vault.${NC}"
 echo ""
